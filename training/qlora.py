@@ -279,10 +279,10 @@ class SampleGenerateCallback(transformers.TrainerCallback):
 class SavePeftModelCallback(transformers.TrainerCallback):
     def save_model(self, args, state, kwargs):
         logger.info('Saving PEFT checkpoint...')
-        if state.best_model_checkpoint is not None:
-            checkpoint_folder = os.path.join(state.best_model_checkpoint, "adapter_model")
-        else:
-            checkpoint_folder = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
+        # Always save into the current step's checkpoint folder. Writing into
+        # state.best_model_checkpoint would overwrite the best adapter with the
+        # current weights.
+        checkpoint_folder = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
 
         peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
         kwargs["model"].save_pretrained(peft_model_path)
@@ -300,8 +300,10 @@ class SavePeftModelCallback(transformers.TrainerCallback):
             with open(fname, 'a'):
                 os.utime(fname, times)
 
-        touch(join(args.output_dir, 'completed'))
+        # Save first so a crash during the final save doesn't leave the run
+        # marked as completed.
         self.save_model(args, state, kwargs)
+        touch(join(args.output_dir, 'completed'))
 
 def get_accelerate_model(args, checkpoint_dir):
 
@@ -511,7 +513,7 @@ def local_dataset(dataset_name):
     if dataset_name.endswith('.json'):
         full_dataset = Dataset.from_json(path_or_paths=dataset_name)
     elif dataset_name.endswith('.jsonl'):
-        full_dataset = Dataset.from_json(filename=dataset_name, format='jsonlines')
+        full_dataset = Dataset.from_json(path_or_paths=dataset_name)
     elif dataset_name.endswith('.csv'):
         full_dataset = Dataset.from_pandas(pd.read_csv(dataset_name))
     elif dataset_name.endswith('.tsv'):
@@ -571,8 +573,8 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
                     args.dataset_format = args.dataset_format if args.dataset_format else "alpaca"
                     full_dataset = local_dataset(dataset_name)
                     return full_dataset
-                except:
-                    raise ValueError(f"Error loading dataset from {dataset_name}")
+                except Exception as e:
+                    raise ValueError(f"Error loading dataset from {dataset_name}: {e}") from e
             else:
                 raise NotImplementedError(f"Dataset {dataset_name} not implemented yet.")
 
@@ -654,8 +656,9 @@ def get_last_checkpoint(checkpoint_dir):
         if is_completed: return None, True # already finished
         max_step = 0
         for filename in os.listdir(checkpoint_dir):
-            if isdir(join(checkpoint_dir, filename)) and filename.startswith('checkpoint'):
-                max_step = max(max_step, int(filename.replace('checkpoint-', '')))
+            step = filename[len('checkpoint-'):]
+            if isdir(join(checkpoint_dir, filename)) and filename.startswith('checkpoint-') and step.isdigit():
+                max_step = max(max_step, int(step))
         if max_step == 0: return None, is_completed # training started, but no checkpoint
         checkpoint_dir = join(checkpoint_dir, f'checkpoint-{max_step}')
         logger.info(f"Found a previous checkpoint at: {checkpoint_dir}")
@@ -677,7 +680,11 @@ def train():
 
     checkpoint_dir, completed_training = get_last_checkpoint(args.output_dir)
     if completed_training:
-        logger.info('Detected that training was already completed!')
+        logger.info(
+            f"Detected that training was already completed in {args.output_dir}; nothing to do. "
+            "Remove the 'completed' file or use a new --output_dir to train again."
+        )
+        return
 
     model = get_accelerate_model(args, checkpoint_dir)
 
